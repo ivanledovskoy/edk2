@@ -72,8 +72,10 @@ PiMmStandaloneMmCpuDriverEntry (
   IN UINTN                         CommBufferAddr
   )
 {
-  EFI_MM_ENTRY_CONTEXT  MmEntryPointContext;
-  UINTN                 CommBufferSize;
+  EFI_MM_ENTRY_CONTEXT       MmEntryPointContext;
+  UINTN                      CommBufferSize;
+  EFI_MM_COMMUNICATE_HEADER  *FixedCtx;
+  EFI_STATUS                 AllocStatus;
 
   if (mGuidedEventContext == NULL) {
     ASSERT (0);
@@ -96,8 +98,10 @@ PiMmStandaloneMmCpuDriverEntry (
         &gEfiMmCommunicateHeaderV3Guid
         ))
   {
-    // This is a v3 header
-    CommBufferSize = ((EFI_MM_COMMUNICATE_HEADER_V3 *)CommBufferAddr)->BufferSize;
+    // This is a v3 header. Size the per-call buffer by the ACTUAL message
+    // (vendor-style), not by the whole BufferSize capacity: header + MessageSize.
+    CommBufferSize = OFFSET_OF (EFI_MM_COMMUNICATE_HEADER_V3, MessageData) +
+                     ((EFI_MM_COMMUNICATE_HEADER_V3 *)CommBufferAddr)->MessageSize;
   } else {
     // This is a v1 header
     // Find out the size of the buffer passed
@@ -105,8 +109,29 @@ PiMmStandaloneMmCpuDriverEntry (
                      OFFSET_OF (EFI_MM_COMMUNICATE_HEADER, Data);
   }
 
-  // Now that the secure world can see the normal world buffer, allocate
-  // memory to copy the communication buffer to the secure world.
+  // PER-CALL allocation of the secure buffer instead of the persistent fixed
+  // buffer. CommBufferSize already = MessageLength + sizeof (EFI_MM_COMMUNICATE_HEADER),
+  // i.e. the full header + payload. Save the fixed buffer in FixedCtx to restore
+  // afterwards (keeps the NULL-check and the next call valid); the root MMI
+  // handler reads mGuidedEventContext.
+  FixedCtx    = mGuidedEventContext;
+  AllocStatus = mMmst->MmAllocatePool (
+                         EfiRuntimeServicesData,
+                         CommBufferSize,
+                         (VOID **)&mGuidedEventContext
+                         );
+  if (EFI_ERROR (AllocStatus)) {
+    mGuidedEventContext = FixedCtx;
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  DEBUG ((
+    DEBUG_INFO,
+    "MMCPU: per-call alloc req=%lu bytes @ %p\n",
+    (UINT64)CommBufferSize,
+    (VOID *)mGuidedEventContext
+    ));
+
   CopyMem (mGuidedEventContext, (CONST VOID *)CommBufferAddr, CommBufferSize);
   mMmHandlerContext = MmHandlerContext;
 
@@ -125,9 +150,10 @@ PiMmStandaloneMmCpuDriverEntry (
 
   mMmEntryPoint (&MmEntryPointContext);
 
-  // Free the memory allocation done earlier and reset the per-cpu context
+  // Copy results back, free the per-call buffer, restore the fixed context.
   CopyMem ((VOID *)CommBufferAddr, (CONST VOID *)mGuidedEventContext, CommBufferSize);
-  ZeroMem (mGuidedEventContext, mGuidedEventContextSize);
+  mMmst->MmFreePool (mGuidedEventContext);
+  mGuidedEventContext = FixedCtx;
 
   mMmHandlerContext = NULL;
 
