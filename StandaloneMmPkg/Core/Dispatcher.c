@@ -409,6 +409,42 @@ MmGetDepexSectionAndPreProccess (
   @retval EFI_ALREADY_STARTED   The MM Dispatcher is already running
 
 **/
+#ifdef MM_FUZZ_CALIBRATE
+//
+// Snapshot-per-module calibration. The host (LibAFL fuzzer/calibrator) intercepts
+// the sync-exit opcode and, at LOAD_PRE, snapshots the machine. If a module hangs
+// in its entry point (never returns), the host restores to that snapshot, writes 1
+// to the address passed in LOAD_PRE (gMmCalSkip), and resumes - so we skip that
+// module. Survivors reach LOAD_POST. Gated out of normal builds: the opcode is an
+// undefined instruction under a plain (non-LibAFL) QEMU.
+//
+#define MM_CAL_INSN_WORD      0x66f23a0f   // LIBAFL custom-insn opcode
+#define MM_CAL_CMD_LOAD_PRE   0x0A10       // x1 = &gMmCalSkip, x2 = &FileName(GUID)
+#define MM_CAL_CMD_LOAD_POST  0x0A11       // x1 = &FileName(GUID), x2 = entry Status
+
+volatile UINT64  gMmCalSkip = 0;           // host pokes 1 to skip the current module
+
+STATIC __attribute__ ((noinline)) UINT64
+MmCalCall (
+  UINT64  Cmd,
+  UINT64  Arg1,
+  UINT64  Arg2
+  )
+{
+  register UINT64  x0 __asm__ ("x0") = Cmd;
+  register UINT64  x1 __asm__ ("x1") = Arg1;
+  register UINT64  x2 __asm__ ("x2") = Arg2;
+
+  __asm__ __volatile__ (
+    ".word 0x66f23a0f\n"
+    : "+r" (x0)
+    : "r" (x1), "r" (x2)
+    : "memory"
+    );
+  return x0;
+}
+#endif
+
 EFI_STATUS
 MmDispatcher (
   VOID
@@ -495,7 +531,34 @@ MmDispatcher (
       //
       DEBUG ((DEBUG_INFO, "StartImage - 0x%x (Standalone Mode)\n", DriverEntry->ImageEntryPoint));
       PERF_START_IMAGE_BEGIN (DriverEntry->ImageHandle);
+ #ifdef MM_FUZZ_CALIBRATE
+      //
+      // Calibration: host snapshots here. gMmCalSkip is reset, then set to 1 by
+      // the host (after a restore) if the module about to run hangs - skip it.
+      //
+      gMmCalSkip = 0;
+      MmCalCall (MM_CAL_CMD_LOAD_PRE, (UINT64)(UINTN)&gMmCalSkip, (UINT64)(UINTN)&DriverEntry->FileName);
+      if (gMmCalSkip != 0) {
+        DEBUG ((DEBUG_WARN, "MMCAL: host-skip (hang) - %g\n", &DriverEntry->FileName));
+        PeCoffLoaderUnloadImage (&ImageContext);
+        MmFreePages (DriverEntry->ImageBuffer, DriverEntry->NumberOfPage);
+        if (DriverEntry->ImageHandle != NULL) {
+          MmUninstallProtocolInterface (
+            DriverEntry->ImageHandle,
+            &gEfiLoadedImageProtocolGuid,
+            &DriverEntry->LoadedImage
+            );
+        }
+
+        continue;
+      }
+
       Status = ((MM_IMAGE_ENTRY_POINT)(UINTN)DriverEntry->ImageEntryPoint)(DriverEntry->ImageHandle, &gMmCoreMmst);
+
+      MmCalCall (MM_CAL_CMD_LOAD_POST, (UINT64)(UINTN)&DriverEntry->FileName, (UINT64)Status);
+ #else
+      Status = ((MM_IMAGE_ENTRY_POINT)(UINTN)DriverEntry->ImageEntryPoint)(DriverEntry->ImageHandle, &gMmCoreMmst);
+ #endif
       PERF_START_IMAGE_END (DriverEntry->ImageHandle);
       if (EFI_ERROR (Status)) {
         DEBUG ((DEBUG_INFO, "StartImage Status - %r\n", Status));
