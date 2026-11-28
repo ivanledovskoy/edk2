@@ -574,6 +574,61 @@ ArmSetMemoryRegionReadWritePerm (
 }
 
 /**
+  Change memory permission to no-access (fault on both read and write),
+  ignoring former permission. Used to build HeapGuard-style guard pages.
+  Note: the SPM MM ABI only honours this at SP boot time (SP_STATE_RESET).
+
+  @param [in]  BaseAddress     Base address for the memory region.
+  @param [in]  Length          Length of the memory region.
+
+  @retval EFI_SUCCESS             Request successfull.
+  @retval EFI_INVALID_PARAMETER   A parameter is invalid.
+  @retval EFI_UNSUPPORTED         This function is not implemented by the
+                                  callee.
+  @retval EFI_ACCESS_DENIED       Access denied.
+
+**/
+EFI_STATUS
+ArmSetMemoryRegionNoAccess (
+  IN  EFI_PHYSICAL_ADDRESS  BaseAddress,
+  IN  UINT64                Length
+  )
+{
+  UINT32   PermissionRequest;
+  BOOLEAN  UseFfaAbis;
+
+  if (Length == 0) {
+    return EFI_SUCCESS;
+  }
+
+  UseFfaAbis = IsFfaMemoryAbiSupported (NULL);
+  Length     = ALIGN_VALUE (Length, EFI_PAGE_SIZE);
+
+  if (UseFfaAbis) {
+    //
+    // FF-A MemPerm has no explicit "no access" data permission; the strongest
+    // available is RO (catches OOB writes only).
+    //
+    PermissionRequest = ARM_FFA_SET_MEM_ATTR_MAKE_PERM_REQUEST (
+                          ARM_FFA_SET_MEM_ATTR_DATA_PERM_RO,
+                          ARM_FFA_SET_MEM_ATTR_CODE_PERM_XN
+                          );
+  } else {
+    PermissionRequest = ARM_SPM_MM_SET_MEM_ATTR_MAKE_PERM_REQUEST (
+                          ARM_SPM_MM_SET_MEM_ATTR_DATA_PERM_NO_ACCESS,
+                          ARM_SPM_MM_SET_MEM_ATTR_CODE_PERM_XN
+                          );
+  }
+
+  return RequestMemoryPermissionChange (
+           UseFfaAbis,
+           BaseAddress,
+           Length,
+           PermissionRequest
+           );
+}
+
+/**
   Change memory permission as ROX ignoring former permission.
 
   @param [in]  BaseAddress     Base address for the memory region.

@@ -33,6 +33,19 @@ ArmSetMemoryRegionNoExec (
   );
 
 /**
+  Change memory permission to no-access (fault on read and write). Only
+  honoured by SPM at SP boot time. Used to build HeapGuard guard pages.
+
+  @param [in]  BaseAddress     Base address for the memory region.
+  @param [in]  Length          Length of the memory region.
+**/
+EFI_STATUS
+ArmSetMemoryRegionNoAccess (
+  IN  EFI_PHYSICAL_ADDRESS  BaseAddress,
+  IN  UINT64                Length
+  );
+
+/**
   Clear XN bit preserving other permission.
 
   @param [in]  BaseAddress     Base address for the memory region.
