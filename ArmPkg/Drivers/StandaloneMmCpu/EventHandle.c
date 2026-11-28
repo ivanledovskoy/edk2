@@ -15,6 +15,9 @@
 #include <Library/BaseMemoryLib.h>
 #include <Library/DebugLib.h>
 #include <Library/HobLib.h>
+#ifdef MM_FUZZ_CALIBRATE
+  #include <Library/StandaloneMmMmuLib.h>
+#endif
 
 #include <Protocol/DebugSupport.h> // for EFI_SYSTEM_CONTEXT
 
@@ -53,6 +56,127 @@ EDKII_PI_MM_CPU_DRIVER_EP_PROTOCOL  mPiMmCpuDriverEpProtocol = {
 
 STATIC EFI_MM_ENTRY_POINT            mMmEntryPoint      = NULL;
 STATIC CONST ARM_MM_HANDLER_CONTEXT  *mMmHandlerContext = NULL;
+
+#ifdef MM_FUZZ_CALIBRATE
+//
+// Dynamic HeapGuard: we wrap the MM pool allocator so that, while an
+// MM_COMMUNICATE call is being serviced, EVERY MmAllocatePool allocation is
+// page-backed with a trailing no-access guard page. The buffer is placed flush
+// against the guard, so a read/write even one byte past it faults and is caught
+// by the SP crash oracle (spm_shim_exceptions.S). The guard page is made
+// no-access at runtime via the SPM memory-attributes SMC - the stand's TF-A is
+// patched to allow that outside SP_STATE_RESET. CommBuffer (allocated below via
+// mMmst->MmAllocatePool) is just one such guarded allocation.
+//
+#define HG_MAX_RECS  64
+
+typedef struct {
+  VOID                  *User;   // pointer handed back to the caller
+  EFI_PHYSICAL_ADDRESS  Base;    // page-aligned allocation base
+  UINTN                 Pages;   // total pages incl. the guard page
+} HG_REC;
+
+STATIC EFI_ALLOCATE_POOL     mOrigAllocatePool = NULL;
+STATIC EFI_FREE_POOL         mOrigFreePool     = NULL;
+STATIC HG_REC                mHgRecs[HG_MAX_RECS];
+STATIC UINTN                 mHgCount   = 0;
+STATIC BOOLEAN               mHgActive  = FALSE;  // guard only during a call
+STATIC BOOLEAN               mHgInAlloc = FALSE;  // reentrancy guard
+
+STATIC
+EFI_STATUS
+EFIAPI
+HgAllocatePool (
+  IN  EFI_MEMORY_TYPE  PoolType,
+  IN  UINTN            Size,
+  OUT VOID             **Buffer
+  )
+{
+  EFI_STATUS            Status;
+  EFI_PHYSICAL_ADDRESS  Base;
+  EFI_PHYSICAL_ADDRESS  Guard;
+  UINTN                 DataPages;
+  UINTN                 AlignedSize;
+
+  if (!mHgActive || mHgInAlloc || (Buffer == NULL) || (Size == 0) ||
+      (mHgCount >= HG_MAX_RECS))
+  {
+    return mOrigAllocatePool (PoolType, Size, Buffer);
+  }
+
+  mHgInAlloc = TRUE;
+  DataPages  = EFI_SIZE_TO_PAGES (Size);
+  Status     = mMmst->MmAllocatePages (AllocateAnyPages, PoolType, DataPages + 1, &Base);
+  if (EFI_ERROR (Status)) {
+    mHgInAlloc = FALSE;
+    return mOrigAllocatePool (PoolType, Size, Buffer);  // fall back, no guard
+  }
+
+  Guard  = Base + (UINTN)DataPages * EFI_PAGE_SIZE;
+  Status = ArmSetMemoryRegionNoAccess (Guard, EFI_PAGE_SIZE);
+  if (EFI_ERROR (Status)) {
+    mMmst->MmFreePages (Base, DataPages + 1);
+    mHgInAlloc = FALSE;
+    return mOrigAllocatePool (PoolType, Size, Buffer);  // runtime attr denied
+  }
+
+  // Place the buffer flush against the guard (8-byte aligned start) so that an
+  // overflow of even one byte past an 8-aligned request hits the guard page.
+  AlignedSize = ALIGN_VALUE (Size, 8);
+  *Buffer     = (VOID *)(UINTN)(Guard - AlignedSize);
+
+  mHgRecs[mHgCount].User  = *Buffer;
+  mHgRecs[mHgCount].Base  = Base;
+  mHgRecs[mHgCount].Pages = DataPages + 1;
+  mHgCount++;
+
+  mHgInAlloc = FALSE;
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+EFIAPI
+HgFreePool (
+  IN VOID  *Buffer
+  )
+{
+  UINTN                 Index;
+  EFI_PHYSICAL_ADDRESS  Base;
+  UINTN                 Pages;
+
+  for (Index = 0; Index < mHgCount; Index++) {
+    if (mHgRecs[Index].User == Buffer) {
+      Base  = mHgRecs[Index].Base;
+      Pages = mHgRecs[Index].Pages;
+      // Restore the guard page to RW before the pages go back to the pool.
+      ArmSetMemoryRegionReadWritePerm (Base + (UINTN)(Pages - 1) * EFI_PAGE_SIZE, EFI_PAGE_SIZE);
+      mMmst->MmFreePages (Base, Pages);
+      mHgRecs[Index] = mHgRecs[mHgCount - 1];  // compact
+      mHgCount--;
+      return EFI_SUCCESS;
+    }
+  }
+
+  return mOrigFreePool (Buffer);
+}
+
+/**
+  Install the dynamic HeapGuard pool wrappers. Runs once at SP boot from the CPU
+  driver entry; guarding itself only kicks in while mHgActive is set.
+**/
+VOID
+SetupHeapGuard (
+  VOID
+  )
+{
+  mOrigAllocatePool     = mMmst->MmAllocatePool;
+  mOrigFreePool         = mMmst->MmFreePool;
+  mMmst->MmAllocatePool = HgAllocatePool;
+  mMmst->MmFreePool     = HgFreePool;
+  DEBUG ((DEBUG_INFO, "HeapGuard: dynamic pool guard installed\n"));
+}
+#endif
 
 /**
   The PI Standalone MM entry point for the CPU driver.
@@ -114,7 +238,12 @@ PiMmStandaloneMmCpuDriverEntry (
   // i.e. the full header + payload. Save the fixed buffer in FixedCtx to restore
   // afterwards (keeps the NULL-check and the next call valid); the root MMI
   // handler reads mGuidedEventContext.
-  FixedCtx    = mGuidedEventContext;
+  FixedCtx = mGuidedEventContext;
+ #ifdef MM_FUZZ_CALIBRATE
+  // Turn on HeapGuard for the whole call: CommBuffer and every allocation the
+  // handler makes via MmAllocatePool get a trailing no-access guard page.
+  mHgActive = TRUE;
+ #endif
   AllocStatus = mMmst->MmAllocatePool (
                          EfiRuntimeServicesData,
                          CommBufferSize,
@@ -122,6 +251,9 @@ PiMmStandaloneMmCpuDriverEntry (
                          );
   if (EFI_ERROR (AllocStatus)) {
     mGuidedEventContext = FixedCtx;
+   #ifdef MM_FUZZ_CALIBRATE
+    mHgActive = FALSE;
+   #endif
     return EFI_OUT_OF_RESOURCES;
   }
 
@@ -154,6 +286,9 @@ PiMmStandaloneMmCpuDriverEntry (
   CopyMem ((VOID *)CommBufferAddr, (CONST VOID *)mGuidedEventContext, CommBufferSize);
   mMmst->MmFreePool (mGuidedEventContext);
   mGuidedEventContext = FixedCtx;
+ #ifdef MM_FUZZ_CALIBRATE
+  mHgActive = FALSE;
+ #endif
 
   mMmHandlerContext = NULL;
 

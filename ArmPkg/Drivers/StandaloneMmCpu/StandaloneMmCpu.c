@@ -29,6 +29,17 @@
 //
 extern EDKII_PI_MM_CPU_DRIVER_EP_PROTOCOL  mPiMmCpuDriverEpProtocol;
 
+#ifdef MM_FUZZ_CALIBRATE
+//
+// Dynamic HeapGuard (defined in EventHandle.c): installs wrappers over the MM
+// pool allocator at boot; guarding activates per MM_COMMUNICATE call.
+//
+VOID
+SetupHeapGuard (
+  VOID
+  );
+#endif
+
 //
 // Private copy of the MM system table for future use
 //
@@ -132,6 +143,11 @@ StandaloneMmCpuInitialize (
   if (EFI_ERROR (Status)) {
     goto ErrorHandler;
   }
+
+ #ifdef MM_FUZZ_CALIBRATE
+  // Install the dynamic HeapGuard pool wrappers (fuzzing build).
+  SetupHeapGuard ();
+ #endif
 
   return EFI_SUCCESS;
 
